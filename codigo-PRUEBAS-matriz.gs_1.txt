@@ -1,0 +1,1175 @@
+// ****************************************************************************
+// *** COPIA DE PRUEBAS (27/10/2026, Ricardo) — ligada a "PRUEBAS - BITACORA DE ALMACÉN-MATRIZ".
+// *** NO pegar este archivo en los proyectos reales: aquí los respaldos PDF están APAGADOS.
+// ****************************************************************************
+// ============================================================================
+// BACKEND GOOGLE APPS SCRIPT — App Urbiola Llantas (pedidos / taller / reportes)
+// Versión de referencia: 27/08/2026 (fix de reintentos tras revisar ErroresDoPost)
+// ============================================================================
+// IMPORTANTE: hay DOS proyectos de Apps Script idénticos, uno por sucursal
+// (Matriz y Jacarandas), cada uno ligado a su propio Google Sheet. Cualquier
+// cambio a este código se pega COMPLETO en los dos proyectos y se re-publica
+// como Web App ("Nueva implementación" o actualizar la existente) en ambos.
+// El frontend apunta a cada uno con GAS_URL_MATRIZ y GAS_URL_JACARANDAS.
+// ============================================================================
+
+// ===== Reintento automático al guardar una fila (27/08/2026 — Baron revisó ErroresDoPost y
+// encontró que, en horas pico, Google rechaza el guardado con "Demasiadas invocaciones
+// simultáneas: Hojas de cálculo" — no es un bug de lógica, es que varios vendedores/técnicos
+// guardan casi al mismo tiempo y Sheets tiene un límite de escrituras simultáneas. Antes esa
+// excepción tronaba doPost_impl UNA sola vez, sin reintentar, y la fila se perdía para siempre
+// aunque en la app pareciera que se había guardado bien. Se confirmó con las 10 terminaciones de
+// Orden de Ejecución de llantas que Baron cerró el 26/08/2026 y que, pese a que la app no marcó
+// error visible, nunca llegaron a la pestaña TerminacionesOS.
+// Esta función reintenta el appendRow varias veces con una pausa creciente SOLO cuando el error
+// es de este tipo transitorio (cupo de Google) — cualquier otro error (dato mal formado, pestaña
+// faltante, etc.) se sigue reportando de inmediato a ErroresDoPost, sin reintentar, para no
+// ocultar bugs reales. =====
+function appendRowConReintento(sheet, fila) {
+  var intentos = 0;
+  var maxIntentos = 5;
+  while (true) {
+    try {
+      sheet.appendRow(fila);
+      return;
+    } catch (err) {
+      intentos++;
+      var msg = String(err && err.message ? err.message : err);
+      var esTransitorio = /invocaciones simultáneas|simultaneous invocations|too many requests|rate limit|internal error|timeout/i.test(msg);
+      if (!esTransitorio || intentos >= maxIntentos) throw err;
+      Utilities.sleep(400 * intentos + Math.floor(Math.random() * 300)); // espera creciente + variación aleatoria, para que dos escrituras que chocaron no se vuelvan a topar en el mismo instante
+    }
+  }
+}
+
+// ===== Hoja de pedidos: SIEMPRE la primera pestaña del Sheet (índice 0), sin importar
+// cuál pestaña esté abierta/activa en ese momento en el navegador de quien lo esté viendo.
+// Antes se usaba getActiveSheet(), que apunta a "la pestaña que el usuario tenga abierta",
+// y eso podía romper el folio, el guardado de pedidos y el cambio de status si alguien
+// dejaba abierta la pestaña "OrdenesServicio" en vez de la principal.
+// Si alguna vez reordenas las pestañas del Sheet y la de pedidos deja de ser la primera,
+// cambia aquí el índice (o usa getSheetByName('NombreExacto')).
+function getPedidosSheet() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
+}
+
+// ===== Convierte el valor de una celda de "Fecha" a texto dd/MM/yyyy sin importar cómo
+// haya quedado guardada. Si la columna tiene formato "Automático" (el default de Sheets),
+// al guardar un texto como "19/08/2026" con appendRow, Sheets lo detecta como fecha y lo
+// convierte solo a un valor de tipo Date — al leerlo de vuelta con getValues() ya NO es el
+// string "19/08/2026" sino un objeto Date, y compararlo contra "today" (String) nunca
+// coincide aunque sea el mismo día. Por eso toda comparación de fecha pasa por aquí. =====
+function normalizaFecha(v) {
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), 'dd/MM/yyyy');
+  }
+  return String(v || '');
+}
+
+// ===== Mismo problema que normalizaFecha pero para la columna "Hora": si Sheets la guardó
+// como valor de hora (typeof Date) en vez de texto, la regresa formateada HH:mm en vez de
+// mandar el objeto Date crudo (que llegaba a la app como "1899-12-31T05:06:00.000Z"). =====
+function normalizaHora(v) {
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), 'HH:mm');
+  }
+  return String(v || '');
+}
+
+// ===== Contador ATÓMICO de folios (22/08/2026 — corrige bug reportado por Baron: dos
+// vendedores generando un vale casi al mismo tiempo recibían el MISMO número de folio, y sus
+// pedidos/Órdenes de Ejecución terminaban mezclados en una sola tarjeta).
+//
+// El código viejo (ver abajo, ya no se usa) calculaba "next" CONTANDO cuántos folios de hoy ya
+// existían en la hoja — pero solo LEÍA, nunca RESERVABA nada. El candado (LockService) se
+// soltaba en cuanto terminaba esa lectura, antes de que el vendedor confirmara y se hiciera el
+// POST real que escribe la fila. Si Baron y Oscar pedían folio casi al mismo tiempo, ambos
+// veían "todavía no existe el folio 6 de hoy" y a los DOS se les daba el 6 — la vuelta de red
+// entre "pedir folio" y "guardar el pedido" (fetchNextFolio -> finalizeVale en el frontend) es
+// tiempo de sobra para que eso pase.
+//
+// La corrección: usar un contador guardado en PropertiesService (memoria propia de CADA
+// proyecto de Apps Script — Matriz y Jacarandas ya tienen proyectos separados, así que sus
+// contadores nunca se cruzan) que se lee Y se incrementa dentro del MISMO candado, en la misma
+// operación — eso es lo que lo hace atómico: para el segundo vendedor que llega una fracción de
+// segundo después, el contador YA quedó en 6, así que a él le toca el 7, sin importar si su
+// pedido todavía no se ha guardado en la hoja.
+function siguienteNumeroAtomico(clave) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var props = PropertiesService.getScriptProperties();
+    var actual = parseInt(props.getProperty(clave) || '0', 10);
+    if (isNaN(actual)) actual = 0;
+    var siguiente = actual + 1;
+    props.setProperty(clave, String(siguiente));
+    return siguiente;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ===== Devuelve el siguiente folio del día (formato PREFIJO+DDMMYY-N, ej. MAT310726-1),
+// o la lista de pendientes de mostrador de hoy si viene ?action=pendientes =====
+function doGet(e) {
+  var action = (e && e.parameter && e.parameter.action) || 'folio';
+  if (action === 'pendientes') {
+    return getPendientesHoy(e);
+  }
+  if (action === 'osHoy') {
+    return getOSHoy(e);
+  }
+  if (action === 'folioDiagnostico') {
+    return getFolioDiagnostico(e);
+  }
+  if (action === 'diagnosticosHoy') {
+    return getDiagnosticosHoy(e);
+  }
+  if (action === 'cotizacionesHoy') {
+    return getCotizacionesHoy(e);
+  }
+  if (action === 'ordenesServicioRefaccionesHoy') {
+    return getOrdenesServicioRefaccionesHoy(e);
+  }
+  if (action === 'validacionesHoy') {
+    return getValidacionesHoy(e);
+  }
+  if (action === 'tarifasMecanicos') {
+    return getTarifasMecanicos(e);
+  }
+  if (action === 'ordenesServicioTodas') {
+    return getOrdenesServicioTodas(e);
+  }
+  if (action === 'tarifasMontajeLlantas') {
+    return getTarifasMontajeLlantas(e);
+  }
+  if (action === 'terminacionesOSTodas') {
+    return getTerminacionesOSTodas(e);
+  }
+  // Conciliación de vales vs Alpha (27/10/2026) — ver bloque CONCILIACIÓN al final del archivo.
+  if (action === 'valesDia') {
+    return getValesDia(e);
+  }
+  if (action === 'conciliaciones') {
+    return getConciliaciones(e);
+  }
+  // Pedidos de revendedores (31/10/2026) — ver bloque PEDIDOS DE REVENDEDORES al final.
+  if (action === 'pedidosRevendedores') {
+    return getPedidosRevendedores(e);
+  }
+  if (action === 'folioOSRDirecta') {
+    // Antes este folio se armaba por completo en el navegador del vendedor, contando cuántas
+    // Órdenes de Servicio Directa había en la lista de "hoy" que ya tenía descargada — sin
+    // candado ni servidor de por medio. Mismo bug que el folio de pedidos, con margen de choque
+    // todavía más grande. Ahora usa el mismo contador atómico (22/08/2026).
+    var todayOSRD = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'ddMMyy');
+    var nextOSRD = siguienteNumeroAtomico('folio_osrdirecta_' + todayOSRD);
+    return ContentService.createTextOutput(JSON.stringify({ today: todayOSRD, next: nextOSRD }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'ddMMyy');
+  var next = siguienteNumeroAtomico('folio_pedido_' + today);
+
+  return ContentService.createTextOutput(JSON.stringify({ today: today, next: next }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Pendientes de mostrador de HOY: renglones de la hoja de pedidos con Status="Pendiente"
+// y Fecha=hoy. Si viene ?vendedor=NOMBRE, se filtra solo a ese vendedor (vista del vendedor);
+// sin ese parámetro trae TODOS (vista del administrador de almacén). =====
+function getPendientesHoy(e) {
+  var sheet = getPedidosSheet();
+  var data = sheet.getDataRange().getValues();
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy');
+  var vendedorFiltro = (e.parameter.vendedor || '').trim();
+
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var fecha = normalizaFecha(row[1]);
+    var vendedor = String(row[3]);
+    var status = String(row[11]);
+    if (fecha !== today) continue;
+    if (status !== 'Pendiente') continue;
+    if (vendedorFiltro && vendedor !== vendedorFiltro) continue;
+    out.push({
+      // Mismo fix de fecha/hora sin normalizar que en getOSHoy (22/08/2026).
+      folio: row[0], fecha: normalizaFecha(row[1]), hora: normalizaHora(row[2]), vendedor: row[3],
+      clave: row[4], medida: row[5], marca: row[6], modelo: row[7],
+      desc: row[8], cantidad: row[9], tipo: row[10], status: row[11],
+      solicitudPara: row[12], sucursal: row[13], comentario: row[14]
+    });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Órdenes de Servicio para reimprimir y para marcar terminado — y, desde el 27/08/2026,
+// también la fuente del panel "Reporte de OS" con filtro de fecha/vendedor en el frontend.
+// Antes se filtraba estricto a fecha=hoy (mismo bug que ya se había corregido en
+// getDiagnosticosHoy/getCotizacionesHoy): en cuanto cruzaba la medianoche, una Orden de
+// Ejecución de ayer que nadie había cerrado desaparecía de la lista y ya no había forma de
+// marcarla terminado desde la app — que fue justo lo que le pasó a Baron/Sol el 25/08/2026 con
+// 10 órdenes de llantas del día anterior. Luego (27/08/2026) se le quitó TODO filtro de fecha
+// en el servidor: ahora regresa el histórico completo y es el frontend el que decide qué rango
+// mostrar (Baron pidió poder filtrar el reporte por fecha y por vendedor). El frontend además
+// ya solo consulta la sucursal del vendedor en sesión (nunca ambas), así nadie ve Órdenes de
+// Servicio de la otra sucursal. =====
+function getOSHoy(e) {
+  var osSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('OrdenesServicio');
+  if (!osSheet) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var data = osSheet.getDataRange().getValues();
+
+  var terminadosSet = {};
+  var termSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('TerminacionesOS');
+  if (termSheet) {
+    var termData = termSheet.getDataRange().getValues();
+    for (var t = 1; t < termData.length; t++) {
+      var fTerm = String(termData[t][0] || '');
+      if (fTerm) terminadosSet[fTerm] = true;
+    }
+  }
+
+  var grouped = {};
+  var order = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var folio = String(row[0] || '');
+    if (!folio) continue;
+
+    if (!grouped[folio]) {
+      grouped[folio] = {
+        folio: folio,
+        pedidoFolioTxt: String(row[1] || ''),   // B - Folio(s) de pedido relacionado(s)
+        // fecha/hora SIN normalizar (22/08/2026): si la columna quedó con formato de fecha/hora
+        // "Automático" en Sheets, getValues() regresa un objeto Date de verdad, y
+        // JSON.stringify() lo convierte solo con .toISOString() — de ahí el "1899-12-30T..."
+        // que vio Baron en "Órdenes de Servicio — hoy" (1899-12-30 es el día cero de Sheets
+        // para valores de solo-hora). normalizaFecha/normalizaHora ya existían para este mismo
+        // problema en otras rutas; aquí se les había olvidado aplicar.
+        fecha: normalizaFecha(row[2]), hora: normalizaHora(row[3]), vendedor: row[4], sucursal: row[5], referencia: row[6],
+        telefono: row[7], marcaVehiculo: row[8], submarcaVehiculo: row[9], anioVehiculo: row[10],
+        serviciosTxt: String(row[16] || ''),      // Q
+        vehiculoTipoTxt: String(row[17] || ''),   // R
+        posicionesTxt: String(row[18] || ''),     // S
+        llantasViejasTxt: String(row[19] || ''),  // T
+        status: row[20],                          // U
+        montajeUbicacion: row[21],                // V
+        candadoSeguridadTxt: String(row[22] || ''), // W
+        comentariosEspeciales: row[23],           // X
+        tecnico: row[24],                         // Y
+        montajeRin: row[25] || '',                // Z
+        tecnicoServicios: row[26] || '',          // AA
+        clienteNombre: row[27] || '',              // AB
+        items: []
+      };
+      order.push(folio);
+    }
+    grouped[folio].items.push({
+      clave: row[11], medida: row[12], marca: row[13], modelo: row[14], cantidad: row[15]
+    });
+  }
+
+  var out = order.map(function (f) { return grouped[f]; });
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Folio propio de Diagnóstico. Independiente del folio de vale — un diagnóstico
+// puede arrancar sin que haya llantas de por medio. =====
+function getFolioDiagnostico(e) {
+  // Mismo fix de fondo que el folio de pedidos (22/08/2026): contador atómico en vez de
+  // contar filas existentes, para que dos vendedores pidiendo folio de diagnóstico casi al
+  // mismo tiempo nunca reciban el mismo número.
+  var today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'ddMMyy');
+  var next = siguienteNumeroAtomico('folio_diagnostico_' + today);
+  return ContentService.createTextOutput(JSON.stringify({ today: today, next: next }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Siguiente versión de cotización para un folio de diagnóstico dado. Cada vez que el
+// cliente NO autoriza y el vendedor ajusta, se agrega una fila NUEVA con versión+1 — nunca se
+// edita la fila anterior. Así queda el rastro completo de qué se propuso, qué se rechazó y qué
+// se autorizó, sin trabajo extra para el vendedor (solo edita y reenvía). =====
+function siguienteVersionCotizacion(folioDiagnostico) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('CotizacionesRefacciones');
+  if (!sheet) return 1;
+  var data = sheet.getDataRange().getValues();
+  var maxV = 0;
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(folioDiagnostico)) {
+      var v = Number(data[i][1]) || 0;
+      if (v > maxV) maxV = v;
+    }
+  }
+  return maxV + 1;
+}
+
+// ===== Diagnósticos (TODOS, ya no filtrados por fecha ni por status — antes decía "de HOY" y
+// en cuanto cruzaba la medianoche los pendientes de ayer desaparecían de la lista aunque
+// siguieran sin cotizar. El filtro de "solo los que faltan por cotizar" ahora lo hace la propia
+// pantalla en el navegador, NO el backend — así este mismo endpoint también sirve para jalar
+// cliente/vehículo de un diagnóstico YA cotizado cuando se genera la Orden de Servicio, que si
+// no, se quedaría sin esos datos en cuanto el diagnóstico pasara a "Cotizado"). Si viene
+// ?vendedor=NOMBRE se filtra a ese vendedor; sin eso trae todos. =====
+function getDiagnosticosHoy(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Diagnosticos');
+  if (!sheet) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var data = sheet.getDataRange().getValues();
+  var vendedorFiltro = (e.parameter.vendedor || '').trim();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    var vendedor = String(row[4] || '');
+    if (vendedorFiltro && vendedor !== vendedorFiltro) continue;
+    var puntos = [];
+    try { puntos = JSON.parse(row[12] || '[]'); } catch (err) { puntos = []; }
+    out.push({
+      folio: row[0], folioVale: row[1], fecha: normalizaFecha(row[2]), hora: normalizaHora(row[3]), vendedor: row[4],
+      sucursal: row[5], referencia: row[6], telefono: row[7], marcaVehiculo: row[8],
+      submarcaVehiculo: row[9], anioVehiculo: row[10], mecanico: row[11],
+      puntosDanados: puntos, status: row[13], comentarios: row[14],
+      folioOS: row[15] || ''       // P - Folio de Orden de Ejecución de llantas relacionada (24/09/2026:
+                                    // se empieza a exponer para el Tablero del Reporte de OS, columna
+                                    // "Diagnóstico" — antes se guardaba pero no se regresaba al frontend)
+    });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Cotizaciones de refacciones PENDIENTES (ya no se filtra por fecha, mismo motivo que
+// getDiagnosticosHoy — un vendedor puede tardar más de un día en conseguir la autorización del
+// cliente o en generar la Orden de Servicio, y antes esa cotización se volvía invisible en
+// cuanto pasaba la medianoche). Trae TODAS las versiones; el frontend decide cuál mostrar como
+// la vigente por folio (la de versión más alta). =====
+function getCotizacionesHoy(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('CotizacionesRefacciones');
+  if (!sheet) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var data = sheet.getDataRange().getValues();
+  var vendedorFiltro = (e.parameter.vendedor || '').trim();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    var vendedor = String(row[4] || '');
+    if (vendedorFiltro && vendedor !== vendedorFiltro) continue;
+    var items = [];
+    try { items = JSON.parse(row[6] || '[]'); } catch (err) { items = []; }
+    out.push({
+      folio: row[0], version: row[1], fecha: normalizaFecha(row[2]), hora: normalizaHora(row[3]), vendedor: row[4],
+      sucursal: row[5], items: items, margen: row[7], montoTotal: row[8],
+      estado: row[9], comentarios: row[10]
+    });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Órdenes de Servicio de Refacciones (piezas/mano de obra, sin llantas) — sin filtro de
+// fecha, mismo motivo que las demás: el vendedor que marca "trabajo terminado" puede hacerlo
+// horas o días después de generada la OS. Se usa para saber qué técnico(s) quedaron asignados
+// a un folio+versión cuando se arma el comprobante de trabajo terminado. =====
+function getOrdenesServicioRefaccionesHoy(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('OrdenesServicioRefacciones');
+  if (!sheet) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var data = sheet.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    var items = [];
+    try { items = JSON.parse(row[13] || '[]'); } catch (err) { items = []; }
+    out.push({
+      folio: row[0], folioCotizacion: row[1], versionCotizacion: row[2],
+      fecha: normalizaFecha(row[3]), hora: normalizaHora(row[4]), vendedor: row[5], sucursal: row[6],
+      referencia: row[7], telefono: row[8], marcaVehiculo: row[9], submarcaVehiculo: row[10], anioVehiculo: row[11],
+      tecnico: row[12], items: items, montoTotal: row[14], comentarios: row[15],
+      tecnicoLlantero: row[16] || ''
+    });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Validaciones (comprobantes de trabajo terminado) — sin filtro de fecha. Se usa para
+// saber si un folio+versión YA tiene comprobante guardado (así no se puede marcar 2 veces como
+// terminado), y es de donde la administradora saca, por mecánico, qué se validó como ejecutado
+// para calcular la comisión. =====
+function getValidacionesHoy(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Validaciones');
+  if (!sheet) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var data = sheet.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    var itemsValidados = [];
+    try { itemsValidados = JSON.parse(row[8] || '[]'); } catch (err) { itemsValidados = []; }
+    out.push({
+      folio: row[0], version: row[1], fecha: normalizaFecha(row[2]), hora: normalizaHora(row[3]),
+      vendedor: row[4], mecanico: row[5], sucursal: row[6], itemsValidados: itemsValidados,
+      comentarios: row[9]
+    });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Tasas de comisión por mecánico — pestaña "TarifasMecanicos" (Mecánico | % Comisión).
+// Baron/Azucena la editan directo en el Sheet, sin depender de que se vuelva a pegar código cada
+// vez que cambie una tasa o entre/salga un mecánico. La usa el reporte de mano de obra de Sol
+// (RH) para calcular la comisión de cada partida. =====
+function getTarifasMecanicos(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('TarifasMecanicos');
+  if (!sheet) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var data = sheet.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    out.push({ mecanico: String(row[0]).trim(), porcentaje: Number(row[1]) || 0 });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Órdenes de Servicio de llantas (pestaña "OrdenesServicio") — SIN filtro de fecha, mismo
+// motivo que las demás rutas "Todas/Hoy" del reporte de Sol: el rango de fechas lo decide la
+// pantalla, no el backend. Se usa para calcular la comisión de montaje por rin. =====
+function getOrdenesServicioTodas(e) {
+  var osSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('OrdenesServicio');
+  if (!osSheet) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var data = osSheet.getDataRange().getValues();
+  var grouped = {};
+  var order = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    var folio = String(row[0] || '');
+    if (!folio) continue;
+    if (!grouped[folio]) {
+      grouped[folio] = {
+        folio: folio,
+        fecha: normalizaFecha(row[2]), hora: normalizaHora(row[3]), vendedor: row[4], sucursal: row[5],
+        tecnico: row[24] || '', serviciosTxt: String(row[16] || ''), montajeRin: row[25] || '', items: []
+      };
+      order.push(folio);
+    }
+    grouped[folio].items.push({
+      clave: row[11], medida: row[12], marca: row[13], modelo: row[14], cantidad: row[15]
+    });
+  }
+  var out = order.map(function (f) { return grouped[f]; });
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Terminaciones de Órdenes de Ejecución de llantas (pestaña "TerminacionesOS") — SIN
+// filtro de fecha: el frontend usa esto solo para saber qué folios YA tienen comprobante de
+// terminación (candado de flujo, botón "Marcar terminado" desaparece). =====
+function getTerminacionesOSTodas(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('TerminacionesOS');
+  if (!sheet) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var data = sheet.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    // itemsValidados (columna H) faltaba en esta respuesta (22/08/2026) — el frontend la
+    // necesita para el reporte de mano de obra de Sol, que ahora solo paga las partidas que el
+    // vendedor SÍ confirmó como completadas al cerrar la Orden de Ejecución.
+    var itemsValidados = [];
+    try { itemsValidados = JSON.parse(row[7] || '[]'); } catch (errParse) { itemsValidados = []; }
+    out.push({
+      folio: row[0], fecha: normalizaFecha(row[1]), hora: normalizaHora(row[2]),
+      vendedorConfirma: row[3], sucursal: row[4], tecnico: row[5], tecnicoServicios: row[6],
+      itemsValidados: itemsValidados, comentarios: row[8] || ''
+    });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Comisión de montaje por rin — pestaña "TarifasMontajeLlantas" (Tipo | Rin | Precio).
+// Es un pago fijo por CADA llanta instalada, distinto de la comisión por hora/servicio de
+// refacciones — aplica solo a la venta/instalación de llantas (PCR, AGR, TBR). Baron/Azucena la
+// mantienen directo en el Sheet, igual que TarifasMecanicos. La columna "Rin" acepta un número
+// exacto (ej. "16"), un rango (ej. "17-23") o un piso abierto (ej. "21+" = 21 en adelante) — el
+// frontend interpreta esos 3 formatos al calcular la comisión de cada llanta.
+function getTarifasMontajeLlantas(e) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('TarifasMontajeLlantas');
+  if (!sheet) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var data = sheet.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    out.push({ tipo: String(row[0]).trim(), rin: String(row[1]).trim(), precio: Number(row[2]) || 0 });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== Envoltura de diagnóstico (26/08/2026, Baron reportó un montón de doPost fallando cada
+// ~10 min sin poder ver el mensaje de error real desde la pantalla de Ejecuciones/Cloud Logs).
+// Esto NO cambia el comportamiento normal — solo atrapa cualquier error dentro de doPost real
+// (doPost_impl) y lo guarda en una pestaña "ErroresDoPost" del Sheet (se crea sola si no
+// existe), con la fecha, el mensaje de error y el cuerpo crudo que llegó — así se puede ver el
+// error exacto directo en el Sheet, sin depender de la consola de Apps Script. =====
+function doPost(e) {
+  try {
+    return doPost_impl(e);
+  } catch (err) {
+    try {
+      var ss = SpreadsheetApp.getActiveSpreadsheet();
+      var errSheet = ss.getSheetByName('ErroresDoPost');
+      if (!errSheet) {
+        errSheet = ss.insertSheet('ErroresDoPost');
+        errSheet.appendRow(['Fecha/Hora', 'Error', 'Cuerpo recibido (postData)']);
+      }
+      var cuerpoRaw = (e && e.postData && e.postData.contents) ? e.postData.contents : '(sin postData -- e=' + JSON.stringify(e) + ')';
+      errSheet.appendRow([
+        Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm:ss'),
+        String(err && err.stack ? err.stack : err),
+        cuerpoRaw.substring(0, 5000)
+      ]);
+    } catch (errLog) {
+      // Si ni siquiera se pudo loggear el error, no hay nada más que hacer -- no debe tronar dos veces.
+    }
+    return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: String(err) }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// ===== Guarda las líneas del pedido (o de la orden de servicio, según docType) =====
+function doPost_impl(e) {
+  var data = JSON.parse(e.postData.contents);
+
+  if (data.docType === 'conciliacion') {
+    // Conciliación de vales vs Alpha (27/10/2026) — explicaciones y cierres de día.
+    guardarConciliacion(data);
+  } else if (data.docType === 'pedidoRevendedor') {
+    // Pedidos de revendedores (31/10/2026) — regresa el folio REV asignado.
+    return guardarPedidoRevendedor(data);
+  } else if (data.docType === 'statusPedidoRevendedor') {
+    actualizarStatusPedidoRevendedor(data);
+  } else if (data.docType === 'ordenServicio') {
+    var osSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('OrdenesServicio');
+    if (!osSheet) {
+      return ContentService.createTextOutput(JSON.stringify({status: 'error', message: 'Falta la pestaña OrdenesServicio'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    var serviciosTxt = (data.servicios || []).join(', ');
+    var pedidoFolioTxt = data.pedidoFolios ? data.pedidoFolios.join(', ') : data.pedidoFolio;
+    data.items.forEach(function(item) {
+      appendRowConReintento(osSheet, [
+        data.folio,              // A - Folio (folio del pedido + "-OS")
+        pedidoFolioTxt,          // B - Folio(s) Pedido relacionado(s) — puede traer varios separados por coma
+        data.fecha,              // C - Fecha
+        data.hora,               // D - Hora
+        data.vendedor,           // E - Vendedor
+        data.sucursal,           // F - Sucursal
+        data.referencia || '',   // G - Cliente / Referencia
+        data.telefono,           // H - Teléfono
+        data.marcaVehiculo,      // I - Marca Vehículo
+        data.submarcaVehiculo,   // J - Sub Marca
+        data.anioVehiculo || '', // K - Año
+        item.clave,              // L - Clave (llanta)
+        item.medida,             // M - Medida
+        item.marca,              // N - Marca (llanta)
+        item.modelo,             // O - Modelo (llanta)
+        item.cantidad,           // P - Cantidad
+        serviciosTxt,            // Q - Servicios
+        data.vehiculoTipo === '6' ? '6 llantas (doble rodada)' : '4 llantas', // R - Tipo de vehículo
+        (data.posiciones || []).join(', '), // S - Posiciones a instalar
+        data.llantasViejas === 'cliente' ? 'Cliente se las lleva' : (data.llantasViejas === 'taller' ? 'Se quedan en el taller' : ''), // T - Llantas viejas
+        data.status || 'Pendiente', // U - Status
+        data.montajeUbicacion || '', // V - Ubicación del montaje adicional
+        data.candadoSeguridad === 'si' ? 'Sí' : (data.candadoSeguridad === 'no' ? 'No' : ''), // W - Candado/birlo de seguridad
+        data.comentariosEspeciales || '', // X - Comentarios especiales
+        data.tecnico || '', // Y - Técnico que realiza el montaje
+        data.montajeRin || '', // Z - Medida de rin del montaje adicional (comisión del mecánico)
+        // AA - Técnico por servicio (22/08/2026): antes era un nombre suelto, solo para
+        // Alineación. Ahora el frontend manda un objeto {Alineación:'', Balanceo:'', ...} —
+        // se guarda como texto JSON en la celda (Sheets no puede guardar objetos).
+        JSON.stringify(data.tecnicoServicios || {}), // AA - Técnico por servicio, si es distinto del de la columna Y
+        data.clienteNombre || '' // AB - Nombre real del cliente (columna G "Cliente/Referencia" es una nota
+                                  //      libre del vendedor, no siempre es el nombre — ver Task del 21/08/2026)
+      ]);
+    });
+  } else if (data.docType === 'pdfBackup') {
+    // COPIA DE PRUEBAS: respaldos PDF apagados a propósito (no llenar el Drive con vales de prueba).
+    return ContentService.createTextOutput(JSON.stringify({status: 'ok', pruebas: 'pdfBackup omitido'}))
+      .setMimeType(ContentService.MimeType.JSON);
+    // Respaldo individual: guarda el PDF de un vale/OS (generado en el navegador) como archivo
+    // suelto en Drive, además de la fila que ya quedó en el Sheet. No usa LockService porque
+    // solo crea un archivo nuevo, no toca filas existentes.
+    var pdfFolderName = 'Vales PDF Urbiola Llantas';
+    var pdfFolders = DriveApp.getFoldersByName(pdfFolderName);
+    var pdfFolder = pdfFolders.hasNext() ? pdfFolders.next() : DriveApp.createFolder(pdfFolderName);
+    var bytes = Utilities.base64Decode(data.base64);
+    var blob = Utilities.newBlob(bytes, 'application/pdf', data.filename || (data.folio + '.pdf'));
+    pdfFolder.createFile(blob);
+  } else if (data.docType === 'explicacionPendiente') {
+    // Guarda por qué una llanta sigue "en mostrador" sin Orden de Servicio. Se AGREGA a la
+    // columna de Comentarios/Referencia (O) del renglón del pedido original (por Folio+Clave),
+    // sin borrar lo que ya hubiera ahí, y sin tocar el Status (sigue "Pendiente").
+    var lock4 = LockService.getScriptLock();
+    lock4.waitLock(10000);
+    try {
+      var sheet4 = getPedidosSheet();
+      var values4 = sheet4.getDataRange().getValues();
+      for (var k = 1; k < values4.length; k++) {
+        if (String(values4[k][0]) === String(data.folio) && String(values4[k][4]) === String(data.clave)) {
+          var actual = String(values4[k][14] || '');
+          var nuevo = actual ? (actual + ' | Motivo pendiente: ' + data.explicacion) : ('Motivo pendiente: ' + data.explicacion);
+          sheet4.getRange(k + 1, 15).setValue(nuevo); // columna O = Referencia/Comentarios
+          break;
+        }
+      }
+    } finally {
+      lock4.releaseLock();
+    }
+  } else if (data.docType === 'diagnostico') {
+    // Diagnóstico: folio propio (puede o no venir ligado a un folio de vale). Una fila por
+    // diagnóstico. Los 62 puntos de inspección se guardan como JSON con SOLO lo dañado — el
+    // mecánico no marca lo que está bien, así el JSON queda corto y legible.
+    var diagSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Diagnosticos');
+    if (!diagSheet) {
+      return ContentService.createTextOutput(JSON.stringify({status: 'error', message: 'Falta la pestaña Diagnosticos'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    appendRowConReintento(diagSheet, [
+      data.folio,                 // A - Folio de Diagnóstico (propio)
+      data.folioVale || '',       // B - Folio de Vale relacionado (opcional)
+      data.fecha,                 // C - Fecha
+      data.hora,                  // D - Hora
+      data.vendedor,               // E - Vendedor (captura)
+      data.sucursal,               // F - Sucursal
+      data.referencia || '',       // G - Cliente / Referencia
+      data.telefono || '',         // H - Teléfono
+      data.marcaVehiculo || '',    // I - Marca Vehículo
+      data.submarcaVehiculo || '', // J - Sub Marca
+      data.anioVehiculo || '',     // K - Año
+      data.mecanico || '',         // L - Mecánico
+      JSON.stringify(data.puntosDanados || []), // M - Puntos dañados (JSON, solo lo marcado)
+      data.status || 'Abierto',    // N - Status (Abierto / Cotizado / Cerrado)
+      data.comentarios || '',      // O - Comentarios
+      data.folioOS || ''           // P - Folio de Orden de Ejecución de llantas relacionada (opcional, ver abrirDiagDesdeOS)
+    ]);
+  } else if (data.docType === 'cotizacion') {
+    // Cotización de refacciones y mano de obra, ligada al folio de Diagnóstico. Versionado:
+    // cada envío crea una fila NUEVA con versión+1 para ese folio — nunca se edita una fila ya
+    // guardada.
+    var lock5 = LockService.getScriptLock();
+    lock5.waitLock(10000);
+    try {
+      var cotSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('CotizacionesRefacciones');
+      if (!cotSheet) {
+        return ContentService.createTextOutput(JSON.stringify({status: 'error', message: 'Falta la pestaña CotizacionesRefacciones'}))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+      var version = siguienteVersionCotizacion(data.folio);
+      appendRowConReintento(cotSheet, [
+        data.folio,               // A - Folio de Diagnóstico (compartido)
+        version,                  // B - Versión (1, 2, 3...)
+        data.fecha,               // C - Fecha
+        data.hora,                // D - Hora
+        data.vendedor,            // E - Vendedor
+        data.sucursal,            // F - Sucursal
+        JSON.stringify(data.items || []), // G - Piezas y mano de obra (JSON)
+        data.margen != null ? data.margen : 25, // H - Margen de utilidad aplicado (%)
+        data.montoTotal || 0,     // I - Monto total
+        'Pendiente',              // J - Estado (Pendiente / Autorizada / Rechazada)
+        data.comentarios || ''    // K - Comentarios
+      ]);
+      // En cuanto se envía una cotización, el diagnóstico que la originó pasa a "Cotizado".
+      var diagSheet2 = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Diagnosticos');
+      if (diagSheet2) {
+        var diagValues2 = diagSheet2.getDataRange().getValues();
+        for (var dv = 1; dv < diagValues2.length; dv++) {
+          if (String(diagValues2[dv][0]) === String(data.folio)) {
+            diagSheet2.getRange(dv + 1, 14).setValue('Cotizado'); // columna N = Status
+            break;
+          }
+        }
+      }
+    } finally {
+      lock5.releaseLock();
+    }
+  } else if (data.docType === 'autorizacion') {
+    // Marca una versión de cotización específica (Folio + Versión) como Autorizada o
+    // Rechazada. Solo cambia el Estado (columna J) de esa versión puntual.
+    var lock6 = LockService.getScriptLock();
+    lock6.waitLock(10000);
+    try {
+      var cotSheet2 = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('CotizacionesRefacciones');
+      if (cotSheet2) {
+        var values6 = cotSheet2.getDataRange().getValues();
+        for (var m = 1; m < values6.length; m++) {
+          if (String(values6[m][0]) === String(data.folio) && Number(values6[m][1]) === Number(data.version)) {
+            cotSheet2.getRange(m + 1, 10).setValue(data.autorizada ? 'Autorizada' : 'Rechazada'); // columna J
+            // Si viene un motivo (rechazo), se AGREGA a Comentarios (columna K) sin borrar lo
+            // que ya hubiera ahí — mismo patrón que 'explicacionPendiente'.
+            if (data.motivo) {
+              var comentarioActual = String(values6[m][10] || '');
+              var comentarioNuevo = comentarioActual ? (comentarioActual + ' | Motivo rechazo: ' + data.motivo) : ('Motivo rechazo: ' + data.motivo);
+              cotSheet2.getRange(m + 1, 11).setValue(comentarioNuevo); // columna K
+            }
+            break;
+          }
+        }
+      }
+    } finally {
+      lock6.releaseLock();
+    }
+  } else if (data.docType === 'cotizacionOSGenerada') {
+    // Marca una versión de cotización específica (Folio + Versión) como "OS Generada" en cuanto
+    // el vendedor genera la Orden de Servicio desde ella — queda bloqueada de facto.
+    var lock7 = LockService.getScriptLock();
+    lock7.waitLock(10000);
+    try {
+      var cotSheet3 = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('CotizacionesRefacciones');
+      if (cotSheet3) {
+        var values7 = cotSheet3.getDataRange().getValues();
+        for (var n = 1; n < values7.length; n++) {
+          if (String(values7[n][0]) === String(data.folio) && Number(values7[n][1]) === Number(data.version)) {
+            cotSheet3.getRange(n + 1, 10).setValue('OS Generada'); // columna J
+            break;
+          }
+        }
+      }
+    } finally {
+      lock7.releaseLock();
+    }
+  } else if (data.docType === 'ordenServicioRefacciones') {
+    // Orden de Servicio generada a partir de una Cotización YA AUTORIZADA por el cliente —
+    // piezas y mano de obra, sin campos de llantas.
+    var osrSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('OrdenesServicioRefacciones');
+    if (!osrSheet) {
+      return ContentService.createTextOutput(JSON.stringify({status: 'error', message: 'Falta la pestaña OrdenesServicioRefacciones'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    appendRowConReintento(osrSheet, [
+      data.folio,               // A - Folio de OS (folio del diagnóstico + "-OSR")
+      data.folioCotizacion,     // B - Folio de la Cotización origen (mismo que el de Diagnóstico)
+      data.versionCotizacion,   // C - Versión de la cotización autorizada que se usó
+      data.fecha,               // D - Fecha
+      data.hora,                // E - Hora
+      data.vendedor,            // F - Vendedor
+      data.sucursal,            // G - Sucursal
+      data.referencia || '',    // H - Cliente
+      data.telefono || '',      // I - Teléfono
+      data.marcaVehiculo || '', // J - Marca Vehículo
+      data.submarcaVehiculo || '', // K - Sub Marca
+      data.anioVehiculo || '',  // L - Año
+      data.tecnico || '',       // M - Técnico
+      JSON.stringify(data.items || []), // N - Piezas y mano de obra (JSON)
+      data.montoTotal || 0,     // O - Monto total
+      data.comentarios || '',   // P - Comentarios
+      data.tecnicoLlantero || '' // Q - Técnico llantero (opcional, solo si es distinto del principal —
+                                  //     aplica nada más a Alineación/Balanceo/Rotación/Desmontaje-Montaje)
+    ]);
+  } else if (data.docType === 'validacion') {
+    // Validación con evidencia: el mecánico/vendedor confirma que el trabajo de la versión
+    // autorizada realmente se ejecutó. La evidencia (fotos) se sube a Drive y se guarda el
+    // link — no el archivo — en el Sheet.
+    var evFolderName = 'Evidencias Urbiola Llantas';
+    var evFolders = DriveApp.getFoldersByName(evFolderName);
+    var evFolder = evFolders.hasNext() ? evFolders.next() : DriveApp.createFolder(evFolderName);
+    var evidenciaUrls = (data.evidencias || []).map(function(ev, idx) {
+      var bytes = Utilities.base64Decode(ev.base64);
+      var blob = Utilities.newBlob(bytes, ev.mimeType || 'image/jpeg', data.folio + '-ev' + (idx + 1) + '.jpg');
+      var file = evFolder.createFile(blob);
+      return file.getUrl();
+    });
+    var valSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Validaciones');
+    if (!valSheet) {
+      return ContentService.createTextOutput(JSON.stringify({status: 'error', message: 'Falta la pestaña Validaciones'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    appendRowConReintento(valSheet, [
+      data.folio,                 // A - Folio de Diagnóstico/Cotización (compartido)
+      data.version,                // B - Versión de cotización que se validó
+      data.fecha,                  // C - Fecha
+      data.hora,                   // D - Hora
+      data.vendedor,               // E - Vendedor
+      data.mecanico || '',         // F - Mecánico
+      data.sucursal,                // G - Sucursal
+      JSON.stringify(evidenciaUrls), // H - Links de evidencia fotográfica (Drive)
+      JSON.stringify(data.itemsValidados || []), // I - Piezas/servicios confirmados como ejecutados
+      data.comentarios || ''        // J - Comentarios
+    ]);
+  } else if (data.docType === 'productoNegado') {
+    // Medida que se buscó pero no se pudo surtir tal como el cliente la quería. No lleva
+    // ningún dato del cliente — solo demanda no cubierta.
+    var negSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('ProductosNegados');
+    if (!negSheet) {
+      return ContentService.createTextOutput(JSON.stringify({status: 'error', message: 'Falta la pestaña ProductosNegados'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    appendRowConReintento(negSheet, [
+      data.fecha,               // A - Fecha
+      data.hora,                // B - Hora
+      data.vendedor,            // C - Vendedor
+      data.sucursal,            // D - Sucursal
+      data.medida,              // E - Medida
+      data.marcaLlanta,         // F - Marca de llanta pedida
+      data.modeloLlanta || '',  // G - Modelo de llanta pedido
+      data.marcaVehiculo || '', // H - Marca del vehículo
+      data.submarcaVehiculo || '', // I - Submarca del vehículo
+      'Producto Negado'          // J - Tipo de registro (para distinguir de Cotización Sobre Pedido, ver abajo)
+    ]);
+  } else if (data.docType === 'cotizacionSobrePedido') {
+    // Auxiliar de Cotización Sobre Pedido (09/09/2026): llantas de OTRAS marcas que no están en
+    // inventario ni en el catálogo Michelin/BFG. Comparte la misma pestaña ProductosNegados
+    // (columnas A-I quedan vacías para este tipo de registro, se usan J en adelante) para no
+    // tener que crear/mantener una pestaña nueva en ambos Sheets (Matriz y Jacarandas).
+    var cotSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('ProductosNegados');
+    if (!cotSheet) {
+      return ContentService.createTextOutput(JSON.stringify({status: 'error', message: 'Falta la pestaña ProductosNegados'}))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+    appendRowConReintento(cotSheet, [
+      data.fecha,                  // A - Fecha
+      data.hora,                   // B - Hora
+      data.vendedor,                // C - Vendedor
+      data.sucursal,                 // D - Sucursal
+      '', '', '', '', '',           // E-I - no aplica para este tipo de registro
+      'Cotización Sobre Pedido',    // J - Tipo de registro
+      data.descripcion || '',       // K - Descripción del producto cotizado
+      data.tipoProducto || '',      // L - Tipo de producto (PCR/TBR/OTR/AGR/IND/MOTO/ATV/REMOLQUE/IMPLEMENTO/RIN/CAMARA/OTRO)
+      data.costoNeto,               // M - Costo del producto (antes de IVA)
+      data.fleteUnitario,           // N - Flete unitario usado en el cálculo (YA con IVA incluido)
+      data.cantidad,                // O - Cantidad de piezas cotizadas
+      data.precioUnitario,          // P - Precio unitario final (ya con margen e IVA aplicados)
+      data.ivaUnitario,             // Q - IVA desglosado por pieza (informativo; $0 si es Agrícola)
+      data.total,                   // R - Total (precio unitario x cantidad)
+      data.telefonoCliente || '',   // S - Teléfono del cliente (obligatorio en el formulario)
+      data.nombreCliente || '',     // T - Nombre del cliente/contacto (obligatorio en el formulario)
+      data.empresaCliente || '',    // U - Nombre comercial de la empresa del cliente (opcional)
+      data.medida || ''             // V - Medida (ancho/serie/rin) — agregada 11/09/2026
+    ]);
+  } else if (data.docType === 'terminacionOS') {
+    // Terminación de la Orden de Ejecución de llantas — el vendedor confirma con el técnico
+    // qué se hizo y qué no, con razón si algo quedó pendiente. En cuanto existe esta fila
+    // para un Folio, ese trabajo queda cerrado.
+    // 27/08/2026: agregado LockService + appendRowConReintento — este era el ÚNICO guardado
+    // "sensible" (bloquea el pago de comisión del mecánico y libera el folio) que no tenía
+    // candado ni reintento. Baron cerró 10 Órdenes el 26/08/2026 en hora pico y todas se
+    // perdieron con el error de Google "Demasiadas invocaciones simultáneas" sin ningún aviso
+    // en la app — se confirmó revisando la pestaña ErroresDoPost.
+    var lock8 = LockService.getScriptLock();
+    lock8.waitLock(15000);
+    try {
+      var termSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('TerminacionesOS');
+      if (!termSheet) {
+        return ContentService.createTextOutput(JSON.stringify({status: 'error', message: 'Falta la pestaña TerminacionesOS'}))
+          .setMimeType(ContentService.MimeType.JSON);
+      }
+      appendRowConReintento(termSheet, [
+        data.folio,                 // A - Folio de la Orden de Ejecución (OrdenesServicio)
+        data.fecha,                  // B - Fecha
+        data.hora,                   // C - Hora
+        data.vendedorConfirma || '', // D - Vendedor que confirma la terminación
+        data.sucursal || '',         // E - Sucursal
+        data.tecnico || '',          // F - Técnico que realizó el montaje
+        data.tecnicoServicios || '', // G - Técnico de servicios (si fue distinto)
+        JSON.stringify(data.itemsValidados || []), // H - Llantas/servicios confirmados, con completado true/false
+        data.comentarios || ''       // I - Comentarios / razón de lo no concluido
+      ]);
+    } finally {
+      lock8.releaseLock();
+    }
+  } else if (data.docType === 'statusUpdate') {
+    // Busca filas existentes del pedido original (por Folio + Clave) y les actualiza la
+    // columna Status (L). Se usa cuando el vendedor decide, al ligar pedidos, qué llanta se
+    // instaló y cuál se devolvió a almacén.
+    var lock2 = LockService.getScriptLock();
+    lock2.waitLock(10000);
+    try {
+      var sheet2 = getPedidosSheet();
+      var values = sheet2.getDataRange().getValues();
+      (data.updates || []).forEach(function(u) {
+        for (var i = 1; i < values.length; i++) {
+          if (String(values[i][0]) === String(u.folio) && String(values[i][4]) === String(u.clave)) {
+            sheet2.getRange(i + 1, 12).setValue(u.status); // columna L = Status
+          }
+        }
+      });
+    } finally {
+      lock2.releaseLock();
+    }
+  } else {
+    var sheet = getPedidosSheet();
+    data.items.forEach(function(item) {
+      appendRowConReintento(sheet, [
+        data.folio,         // A - Folio
+        data.fecha,         // B - Fecha
+        data.hora,          // C - Hora
+        data.vendedor,      // D - Vendedor
+        item.clave,         // E - Clave
+        item.medida,        // F - Medida
+        item.marca,         // G - Marca
+        item.modelo,        // H - Modelo
+        item.desc,          // I - Descripción
+        item.cantidad,      // J - Cantidad
+        item.tipo,          // K - Tipo
+        'Pendiente',        // L - Status
+        data.solicitudPara, // M - Solicitud Para
+        data.sucursal,       // N - Sucursal (Matriz / Jacarandas)
+        data.comentario || '', // O - Referencia (cliente / vehículo / orden)
+        data.clienteNombre || '', // P - Nombre del cliente (obligatorio en ventas)
+        data.clienteWhatsapp || '' // Q - WhatsApp del cliente (obligatorio en ventas)
+      ]);
+    });
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({status: 'ok'}))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// ===== RESPALDO DIARIO: copia completa de este Sheet a Drive =====
+// Guarda una copia fechada de TODO el archivo (todas las pestañas) en una carpeta de Drive
+// llamada "Respaldos Urbiola Llantas". Protege contra ediciones o borrados accidentales.
+function respaldoDiario() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var folderName = 'Respaldos Urbiola Llantas';
+  var folders = DriveApp.getFoldersByName(folderName);
+  var folder = folders.hasNext() ? folders.next() : DriveApp.createFolder(folderName);
+  var fecha = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  var nombreRespaldo = ss.getName() + ' - Respaldo ' + fecha;
+  var archivoOriginal = DriveApp.getFileById(ss.getId());
+  archivoOriginal.makeCopy(nombreRespaldo, folder);
+}
+
+// ===== Instala el disparador diario. EJECUTAR MANUALMENTE UNA SOLA VEZ =====
+// (▶ Ejecutar, en el editor de Apps Script, con la función "crearTriggerRespaldoDiario"
+// seleccionada). Hay que correrlo por separado en CADA hoja (Matriz y Jacarandas), porque
+// cada una tiene su propio proyecto de Apps Script. El respaldo corre todos los días a las
+// 23:00 (hora del script). Si ya existía un disparador de respaldoDiario, lo borra primero.
+function crearTriggerRespaldoDiario() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'respaldoDiario') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('respaldoDiario')
+    .timeBased()
+    .everyDays(1)
+    .atHour(23)
+    .create();
+}
+
+// ============================================================================
+// ===== CONCILIACIÓN DE VALES vs FACTURAS/REMISIONES DE ALPHA (27/10/2026, Ricardo) =====
+// Propuesta completa: documento "Propuesta: Conciliación de Vales vs Facturas y Remisiones".
+// El vendedor sube a la app sus reportes de Alpha del día anterior (sacados con SU usuario);
+// la app los cruza contra los vales de este Sheet. Aquí solo hay dos cosas:
+//   1) GET ?action=valesDia&fecha=dd/MM/yyyy[&vendedor=NOMBRE]  -> vales de ese día (pestaña de
+//      pedidos, la primera). Sin filtrar por tipo de solicitud ni status: esas reglas (Muestra
+//      en piso nunca se concilia, cancelados fuera) las aplica la pantalla.
+//   2) GET ?action=conciliaciones[&fecha=dd/MM/yyyy]  +  POST docType 'conciliacion' -> pestaña
+//      "Conciliaciones" (se crea sola). Solo se AGREGAN filas (nunca se edita una fila guardada):
+//      cada explicación de diferencia y cada cierre de día es una fila; la más reciente manda.
+// ============================================================================
+var CONC_SHEET_NAME = 'Conciliaciones';
+var CONC_HEADERS = ['FechaRegistro', 'HoraRegistro', 'DiaConciliado', 'Vendedor', 'Sucursal', 'Tipo',
+                    'FolioVale', 'Documento', 'Clave', 'Estatus', 'Motivo', 'Comentario', 'DatosJSON'];
+function getConcSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(CONC_SHEET_NAME);
+  if (!sh) {
+    sh = ss.insertSheet(CONC_SHEET_NAME);
+    sh.appendRow(CONC_HEADERS);
+    sh.getRange('A:C').setNumberFormat('@'); // fecha/hora/día como TEXTO: evita el bug "1899-12-30"
+  }
+  return sh;
+}
+function getValesDia(e) {
+  var fecha = String(e.parameter.fecha || '').trim();
+  var vendedorFiltro = String(e.parameter.vendedor || '').trim();
+  var data = getPedidosSheet().getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    if (fecha && normalizaFecha(row[1]) !== fecha) continue;
+    if (vendedorFiltro && String(row[3]).trim() !== vendedorFiltro) continue;
+    out.push({
+      fila: i + 1,
+      folio: String(row[0]), fecha: normalizaFecha(row[1]), hora: normalizaHora(row[2]),
+      vendedor: String(row[3] || ''), clave: String(row[4] == null ? '' : row[4]),
+      medida: row[5], marca: row[6], modelo: row[7], desc: row[8],
+      cantidad: Number(row[9]) || 0, tipo: row[10], status: String(row[11] || ''),
+      solicitudPara: String(row[12] || ''), sucursal: String(row[13] || ''),
+      comentario: String(row[14] || ''),
+      // P/Q/R: según la época del renglón aquí quedó el nombre del cliente / WhatsApp. Se mandan
+      // las tres tal cual y la pantalla usa la primera que traiga texto.
+      colP: String(row[15] || ''), colQ: String(row[16] || ''), colR: String(row[17] || '')
+    });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+function getConciliaciones(e) {
+  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONC_SHEET_NAME);
+  if (!sh) {
+    return ContentService.createTextOutput(JSON.stringify({ items: [] }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+  var fecha = String((e && e.parameter && e.parameter.fecha) || '').trim();
+  var data = sh.getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var r = data[i];
+    if (!r[0]) continue;
+    var dia = normalizaFecha(r[2]);
+    if (fecha && dia !== fecha) continue;
+    var datos = {};
+    try { datos = JSON.parse(r[12] || '{}'); } catch (err) { datos = {}; }
+    out.push({
+      fechaRegistro: normalizaFecha(r[0]), horaRegistro: normalizaHora(r[1]), dia: dia,
+      vendedor: String(r[3] || ''), sucursal: String(r[4] || ''), tipo: String(r[5] || ''),
+      folioVale: String(r[6] || ''), documento: String(r[7] || ''), clave: String(r[8] || ''),
+      estatus: String(r[9] || ''), motivo: String(r[10] || ''), comentario: String(r[11] || ''),
+      datos: datos
+    });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+function guardarConciliacion(data) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    var sh = getConcSheet();
+    var ahora = new Date();
+    var tz = Session.getScriptTimeZone();
+    (data.filas || [data]).forEach(function (f) {
+      appendRowConReintento(sh, [
+        Utilities.formatDate(ahora, tz, 'dd/MM/yyyy'),   // A - Fecha de registro
+        Utilities.formatDate(ahora, tz, 'HH:mm'),        // B - Hora de registro
+        f.dia || data.dia || '',                         // C - Día conciliado (dd/MM/yyyy)
+        f.vendedor || data.vendedor || '',               // D - Vendedor
+        f.sucursal || data.sucursal || '',               // E - Sucursal
+        f.tipo || '',                                    // F - 'explicacion' | 'cierre' | 'revisado'
+        f.folioVale || '',                               // G - Folio del vale (si aplica)
+        f.documento || '',                               // H - Documento de Alpha (ej. F 71539, Rem 6141)
+        f.clave || '',                                   // I - Clave de producto
+        f.estatus || '',                                 // J - Estatus del cruce (sin_documento, medida_cambiada...)
+        f.motivo || '',                                  // K - Motivo elegido de la lista
+        f.comentario || '',                              // L - Comentario libre
+        JSON.stringify(f.datos || {})                    // M - Detalle (resumen del día, renglones del cruce)
+      ]);
+    });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ============================================================================
+// ===== PEDIDOS DE REVENDEDORES (31/10/2026, Ricardo) =====
+// App aparte para revendedores (solo precio revendedor + disponible/sobre pedido). Cada pedido se
+// guarda aquí Y además el revendedor lo manda por WhatsApp a su vendedor asignado.
+// POST docType 'pedidoRevendedor' -> pestaña "PedidosRevendedores" (se crea sola), una fila por
+// llanta, con folio propio REV+DDMMYY-N del contador atómico (mismo candado que los vales).
+// GET ?action=pedidosRevendedores[&vendedor=NOMBRE] -> para que el vendedor/almacén los consulte.
+// ============================================================================
+var REV_SHEET_NAME = 'PedidosRevendedores';
+var REV_HEADERS = ['Folio', 'Fecha', 'Hora', 'Revendedor', 'Negocio', 'VendedorAsignado', 'Clave', 'Medida',
+                   'Marca', 'Modelo', 'Descripción', 'Cantidad', 'PrecioRevendedor', 'Importe', 'Disponibilidad',
+                   'Status', 'Comentario'];
+function getRevSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(REV_SHEET_NAME);
+  if (!sh) {
+    sh = ss.insertSheet(REV_SHEET_NAME);
+    sh.appendRow(REV_HEADERS);
+    sh.getRange('B:C').setNumberFormat('@'); // fecha/hora como texto (bug "1899-12-30")
+  }
+  return sh;
+}
+function guardarPedidoRevendedor(data) {
+  var tz = Session.getScriptTimeZone();
+  var ahora = new Date();
+  var hoy = Utilities.formatDate(ahora, tz, 'ddMMyy');
+  var folio = 'REV' + hoy + '-' + siguienteNumeroAtomico('folio_revendedor_' + hoy);
+  var fecha = Utilities.formatDate(ahora, tz, 'dd/MM/yyyy');
+  var hora = Utilities.formatDate(ahora, tz, 'HH:mm');
+  var sh = getRevSheet();
+  (data.items || []).forEach(function (it) {
+    appendRowConReintento(sh, [
+      folio, fecha, hora,
+      data.revendedor || '', data.negocio || '', data.vendedorAsignado || '',
+      it.clave || '', it.medida || '', it.marca || '', it.modelo || '', it.desc || '',
+      Number(it.cantidad) || 0,
+      it.precio === '' || it.precio == null ? 'Consultar' : Number(it.precio),
+      it.precio === '' || it.precio == null ? '' : Number(it.precio) * (Number(it.cantidad) || 0),
+      it.disponibilidad || '', 'Pendiente', data.comentario || ''
+    ]);
+  });
+  return ContentService.createTextOutput(JSON.stringify({ status: 'ok', folio: folio, fecha: fecha, hora: hora }))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+function getPedidosRevendedores(e) {
+  var sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(REV_SHEET_NAME);
+  if (!sh) return ContentService.createTextOutput(JSON.stringify({ items: [] })).setMimeType(ContentService.MimeType.JSON);
+  var vend = String((e && e.parameter && e.parameter.vendedor) || '').trim();
+  var data = sh.getDataRange().getValues(), out = [];
+  for (var i = 1; i < data.length; i++) {
+    var r = data[i];
+    if (!r[0]) continue;
+    if (vend && String(r[5]) !== vend) continue;
+    out.push({ folio: r[0], fecha: normalizaFecha(r[1]), hora: normalizaHora(r[2]), revendedor: r[3], negocio: r[4],
+               vendedorAsignado: r[5], clave: String(r[6]), medida: r[7], marca: r[8], modelo: r[9], desc: r[10],
+               cantidad: r[11], precio: r[12], importe: r[13], disponibilidad: r[14], status: r[15], comentario: r[16] });
+  }
+  return ContentService.createTextOutput(JSON.stringify({ items: out })).setMimeType(ContentService.MimeType.JSON);
+}
+// Cambio de status de un pedido de revendedor (todas sus filas, por folio) desde la app de
+// vendedores: "Pendiente" -> "Atendido" / "Cancelado". Se agrega quién y cuándo en Comentario.
+function actualizarStatusPedidoRevendedor(data) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var sh = getRevSheet();
+    var vals = sh.getDataRange().getValues();
+    var nota = (data.status || '') + ' por ' + (data.quien || '') + ' ' +
+               Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yyyy HH:mm');
+    for (var i = 1; i < vals.length; i++) {
+      if (String(vals[i][0]) !== String(data.folio)) continue;
+      sh.getRange(i + 1, 16).setValue(data.status || 'Atendido');                         // P - Status
+      var com = String(vals[i][16] || '');
+      sh.getRange(i + 1, 17).setValue(com ? com + ' | ' + nota : nota);                   // Q - Comentario
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
