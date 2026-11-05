@@ -114,6 +114,15 @@ input,select,textarea{background:var(--surface2);color:var(--text);border:1px so
 .mp table{width:100%;border-collapse:collapse;font-size:13px;}
 .mp td{padding:5px 2px;border-top:1px solid var(--border);vertical-align:top;}
 #btnInstalar{display:none;}
+/* Selección para cotizar varias llantas en un solo mensaje (05/11/2026, igual que vendedores) */
+.card{position:relative;}
+.selchk{position:absolute;top:12px;right:12px;display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:700;color:var(--muted);cursor:pointer;}
+.selchk input{width:22px;height:22px;padding:0;accent-color:var(--gold);cursor:pointer;}
+.card.sel{border-color:var(--gold);box-shadow:0 0 0 1px var(--gold) inset;}
+.card.sel .selchk{color:var(--gold);}
+.selbar{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;}
+#copyBar{position:fixed;left:16px;bottom:16px;background:var(--gold);color:#111;border:none;border-radius:50px;padding:14px 18px;font-weight:800;font-size:15px;box-shadow:0 4px 18px rgba(0,0,0,.45);display:none;z-index:300;}
+@media (max-width:520px){ #copyBar{left:10px;bottom:76px;} }
 /* Computadora: tarjetas en 2 columnas y más ancho */
 @media (min-width:980px){
   .wrap{max-width:1100px;}
@@ -152,11 +161,12 @@ input,select,textarea{background:var(--surface2);color:var(--text);border:1px so
   <div id="res"><div class="empty">Escribe una medida y presiona Buscar.</div></div>
 </div></div>
 <button id="cartFab" onclick="abrirPedido()"></button>
+<button id="copyBar" onclick="copiarSeleccion()"></button>
 <div id="cartOv" onclick="if(event.target===this)cerrarPedido()"><div id="cartPanel"></div></div>
 <div id="mpOv" onclick="if(event.target===this)cerrarMisPedidos()" style="position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:flex-end;justify-content:center;z-index:500;"><div id="mpPanel" style="background:var(--surface);width:100%;max-width:640px;max-height:88vh;overflow-y:auto;border-radius:18px 18px 0 0;padding:16px;"></div></div>
 <div id="toast"></div>
 <script>
-var APP_VERSION = '05/11/2026 13:22';
+var APP_VERSION = '05/11/2026 13:33';
 var GAS_URL = {Matriz: 'https://script.google.com/macros/s/AKfycbzazz85BlB5d7Yamb6Ogh1_6wUEiTgD7EOmStnKH0x1DTJa9fZdsx-XIivw2BSGVhJ8Wg/exec', Jacarandas: ''};
 // Revendedores: clave -> datos. La clave identifica a la persona (igual que en la app de vendedores).
 // vendedor = vendedor asignado que recibe sus pedidos; sucursal = a qué Sheet se guardan.
@@ -209,7 +219,7 @@ function setGan(i){ gan = {t: GANANCIAS[i].t, v: GANANCIAS[i].v}; try { localSto
 // 05/11/2026: mismo formato que la cotización de la app de vendedores (agrupada por medida,
 // con líneas y emojis), pero SIN datos de Urbiola ni existencias en piezas, y con el precio ya
 // con la ganancia del revendedor.
-function textoCotizacion(items){
+function textoCotizacion(items, conTotal){  // conTotal: solo desde el carrito (compra real); en opciones a elegir no se suma
   var neg = yo.negocio || yo.nombre;
   var hoy = new Date(), dd = ('0' + hoy.getDate()).slice(-2) + '/' + ('0' + (hoy.getMonth() + 1)).slice(-2) + '/' + hoy.getFullYear();
   var LINE = '━━━━━━━━━━━━━━━━━━━━━━';
@@ -233,7 +243,7 @@ function textoCotizacion(items){
     });
   });
   t += LINE + '\n';
-  if(varias && tot) t += '💰 *TOTAL: ' + fmt(tot) + '*' + (cons ? ' + llantas a consultar' : '') + '\n';
+  if(conTotal && varias && tot) t += '💰 *TOTAL: ' + fmt(tot) + '*' + (cons ? ' + llantas a consultar' : '') + '\n';
   t += '💲 *Precios con IVA incluido*\n⚠️ Sujetos a disponibilidad al momento de confirmar\n';
   return t;
 }
@@ -276,27 +286,50 @@ function mostrarApp(){
 function buscar(){
   var q = norm($('q').value);
   resultados = q ? P.filter(function(r){ return norm(r[1]) === q; }) : [];
-  $('fMarca').value = ''; $('fDisp').checked = false;
+  $('fMarca').value = ''; $('fDisp').checked = false; $('res').innerHTML = '';
   $('filters').style.display = resultados.length ? 'flex' : 'none';
   pintar();
 }
 function pintar(){
   var el = $('res');
+  var antes = {}; checksSel().forEach(function(c){ if(c.checked) antes[c.getAttribute('data-i')] = 1; });
   if(!$('q').value.trim()){ el.innerHTML = '<div class="empty">Escribe una medida y presiona Buscar.</div>'; return; }
   var fm = normMarca($('fMarca').value), sd = $('fDisp').checked;
   var lista = resultados.filter(function(r){ return (!fm || normMarca(r[2]).indexOf(fm) !== -1) && (!sd || r[7]); });
   lista.sort(function(a, b){ return (b[7] - a[7]) || ((a[6] == null) - (b[6] == null)) || ((a[6] || 0) - (b[6] || 0)); });
   if(!lista.length){ el.innerHTML = '<div class="empty">No encontramos esa medida' + (resultados.length ? ' con ese filtro' : '') + '. Pregunta a tu vendedor por disponibilidad sobre pedido.</div>'; return; }
-  el.innerHTML = '<div class="note" style="margin-bottom:8px">' + lista.length + ' opción(es)</div>' + lista.map(function(r){
+  el.innerHTML = '<div class="selbar"><span class="note">' + lista.length + ' opción(es) · marca ☑ "Cotizar" en las que quieras mandar a tu cliente</span>' +
+    '<button class="btn sec" style="padding:7px 12px;font-size:13px" id="btnSelTodas" onclick="selTodas()">☑ Seleccionar todas</button></div>' + lista.map(function(r){
     var i = P.indexOf(r);
     var pc = precioCliente(r[6]);
     var precio = r[6] == null ? '<div class="consultar">Precio: consultar con su vendedor</div>' : '<div><div class="price">' + fmt(r[6]) + '<small>Tu precio revendedor por pieza · IVA incluido</small></div>' +
       (gan.t ? '<div class="cli">' + fmt(pc) + ' <small>precio a tu cliente (+' + ganTxt(gan) + ')</small></div>' : '') + '</div>';
-    return '<div class="card"><div class="med">' + esc(r[1]) + '</div><div class="mm">' + esc(r[2]) + ' ' + esc(r[3]) + '</div><div class="desc">' + esc(r[4]) + '</div>' +
+    return '<div class="card" id="cd' + i + '"><label class="selchk"><input type="checkbox" class="card-check" data-i="' + i + '" onchange="marcarSel(this)"> Cotizar</label><div class="med">' + esc(r[1]) + '</div><div class="mm">' + esc(r[2]) + ' ' + esc(r[3]) + '</div><div class="desc">' + esc(r[4]) + '</div>' +
       '<div style="margin-top:8px"><span class="badge ' + (r[7] ? 'disp">✔ Disponible' : 'sobre">Sobre pedido') + '</span><span class="badge tipo">' + esc(r[5]) + '</span></div>' +
-      '<div class="row">' + precio + '<div class="qty"><input type="number" min="1" value="4" id="qt' + i + '"><button class="btn" onclick="agregar(' + i + ')">+ Pedido</button></div></div>' +
-      '<div style="margin-top:8px;text-align:right"><button class="btn sec" style="padding:7px 12px;font-size:13px" onclick="copiarUno(' + i + ')">📋 Copiar cotización para mi cliente</button></div></div>';
+      '<div class="row">' + precio + '<div class="qty"><input type="number" min="1" value="4" id="qt' + i + '"><button class="btn" onclick="agregar(' + i + ')">+ Pedido</button></div></div></div>';
   }).join('');
+  checksSel().forEach(function(c){ if(antes[c.getAttribute('data-i')]){ c.checked = true; marcarSel(c); } });
+  pintarCopia();
+}
+// ---- Selección para cotizar ----
+function checksSel(){ return Array.prototype.slice.call(document.querySelectorAll('#res .card-check')); }
+function marcarSel(ch){ var c = $('cd' + ch.getAttribute('data-i')); if(c) c.classList.toggle('sel', ch.checked); pintarCopia(); }
+function selTodas(){
+  var cs = checksSel(), todas = cs.length && cs.every(function(c){ return c.checked; });
+  cs.forEach(function(c){ c.checked = !todas; marcarSel(c); });
+}
+function pintarCopia(){
+  var cs = checksSel(), n = cs.filter(function(c){ return c.checked; }).length;
+  var b = $('copyBar'); b.style.display = n ? 'block' : 'none';
+  b.textContent = '📋 Copiar cotización (' + n + ')' + (gan.t ? ' +' + ganTxt(gan) : '');
+  var t = $('btnSelTodas'); if(t) t.textContent = (cs.length && n === cs.length) ? '☐ Quitar selección' : '☑ Seleccionar todas';
+}
+function copiarSeleccion(){
+  var items = checksSel().filter(function(c){ return c.checked; }).map(function(c){
+    var i = +c.getAttribute('data-i'), q = parseInt(($('qt' + i) || {}).value, 10); return itemDe(i, q > 0 ? q : 1);
+  });
+  if(!items.length){ toast('Marca al menos una llanta con "Cotizar"'); return; }
+  copiarTexto(textoCotizacion(items));
 }
 function guardarPedido(){ try { localStorage.setItem('rev_pedido', JSON.stringify(pedido)); } catch(e){} pintarFab(); }
 function agregar(i){
@@ -327,7 +360,7 @@ function pintarPedido(aviso){
     }).join('') +
     '<div class="tot">Total (IVA incluido): ' + fmt(totalPedido()) + (hayConsultar ? '<div class="note">+ productos con precio a consultar</div>' : '') + '</div>' +
     '<textarea id="pedCom" rows="2" style="width:100%" placeholder="Comentario para tu vendedor (opcional): fecha de entrega, forma de pago…"></textarea>' +
-    '<button class="btn sec" style="width:100%;margin-top:10px" onclick="copiarTexto(textoCotizacion(pedido))">📋 Copiar cotización para mi cliente' + (gan.t ? ' (+' + ganTxt(gan) + ')' : '') + '</button>' +
+    '<button class="btn sec" style="width:100%;margin-top:10px" onclick="copiarTexto(textoCotizacion(pedido, true))">📋 Copiar cotización para mi cliente' + (gan.t ? ' (+' + ganTxt(gan) + ')' : '') + '</button>' +
     '<button class="btn" id="btnEnviar" style="width:100%;margin-top:10px" onclick="confirmarPedido()">📲 Enviar pedido a ' + esc(yo.vendedor) + '</button>' +
     '<div class="note" style="margin-top:8px">Se registra en el sistema y se abre WhatsApp con tu pedido para mandarlo a tu vendedor. Precios y disponibilidad sujetos a confirmación.</div>';
 }
