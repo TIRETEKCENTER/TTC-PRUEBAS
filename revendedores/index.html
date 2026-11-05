@@ -156,7 +156,7 @@ input,select,textarea{background:var(--surface2);color:var(--text);border:1px so
 <div id="mpOv" onclick="if(event.target===this)cerrarMisPedidos()" style="position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:flex-end;justify-content:center;z-index:500;"><div id="mpPanel" style="background:var(--surface);width:100%;max-width:640px;max-height:88vh;overflow-y:auto;border-radius:18px 18px 0 0;padding:16px;"></div></div>
 <div id="toast"></div>
 <script>
-var APP_VERSION = '05/11/2026 11:32';
+var APP_VERSION = '05/11/2026 13:22';
 var GAS_URL = {Matriz: 'https://script.google.com/macros/s/AKfycbzazz85BlB5d7Yamb6Ogh1_6wUEiTgD7EOmStnKH0x1DTJa9fZdsx-XIivw2BSGVhJ8Wg/exec', Jacarandas: ''};
 // Revendedores: clave -> datos. La clave identifica a la persona (igual que en la app de vendedores).
 // vendedor = vendedor asignado que recibe sus pedidos; sucursal = a qué Sheet se guardan.
@@ -206,18 +206,35 @@ function pintarGan(){
 }
 function setGan(i){ gan = {t: GANANCIAS[i].t, v: GANANCIAS[i].v}; try { localStorage.setItem('rev_ganancia', JSON.stringify(gan)); } catch(e){} pintarGan(); pintar(); }
 // ===== Cotización para el cliente del revendedor (sin datos de Urbiola) =====
+// 05/11/2026: mismo formato que la cotización de la app de vendedores (agrupada por medida,
+// con líneas y emojis), pero SIN datos de Urbiola ni existencias en piezas, y con el precio ya
+// con la ganancia del revendedor.
 function textoCotizacion(items){
   var neg = yo.negocio || yo.nombre;
   var hoy = new Date(), dd = ('0' + hoy.getDate()).slice(-2) + '/' + ('0' + (hoy.getMonth() + 1)).slice(-2) + '/' + hoy.getFullYear();
-  var t = '*Cotización · ' + neg + '*\n' + dd + '\n\n', tot = 0, cons = false;
-  items.forEach(function(x){
-    var pc = precioCliente(x.precio);
-    t += '• ' + x.cantidad + ' pzas · ' + x.medida + ' ' + x.marca + ' ' + x.modelo + '\n   ';
-    if(pc == null){ t += 'Precio: a consultar\n'; cons = true; }
-    else { t += fmt(pc) + ' c/u · ' + fmt(pc * x.cantidad) + '\n'; tot += pc * x.cantidad; }
+  var LINE = '━━━━━━━━━━━━━━━━━━━━━━';
+  var porMedida = {}, orden = [];
+  items.forEach(function(x){ if(!porMedida[x.medida]){ porMedida[x.medida] = []; orden.push(x.medida); } porMedida[x.medida].push(x); });
+  var t = '🏪 *' + neg.toUpperCase() + '*\n📅 Cotización ' + dd + '\n\n', tot = 0, cons = false, varias = items.length > 1;
+  orden.forEach(function(med){
+    t += '🛞 *MEDIDA: ' + med + '*\n' + LINE + '\n\n';
+    porMedida[med].sort(function(a, b){ var pa = precioCliente(a.precio), pb = precioCliente(b.precio); return (pb == null ? -1 : pb) - (pa == null ? -1 : pa); });
+    porMedida[med].forEach(function(x){
+      var pc = precioCliente(x.precio);
+      t += '🚗 *' + String(x.marca).toUpperCase() + '* [' + String(x.tipo || 'PCR').toUpperCase() + '] - ' + x.modelo + '\n';
+      t += (x.disponibilidad === 'Disponible' ? '   ✅ Disponible\n' : '   📦 Sobre pedido\n');
+      if(pc == null){ t += '   💬 Precio: a consultar\n'; cons = true; }
+      else {
+        t += '   💵 *Precio Unitario: ' + fmt(pc) + '*\n';
+        if(x.cantidad > 1) t += '   🧮 ' + x.cantidad + ' pzas: ' + fmt(pc * x.cantidad) + '\n';
+        tot += pc * x.cantidad;
+      }
+      t += '\n';
+    });
   });
-  t += '\n*Total (IVA incluido): ' + fmt(tot) + '*' + (cons ? ' + llantas a consultar' : '');
-  t += '\nPrecios con IVA incluido. Sujetos a disponibilidad al momento de confirmar.';
+  t += LINE + '\n';
+  if(varias && tot) t += '💰 *TOTAL: ' + fmt(tot) + '*' + (cons ? ' + llantas a consultar' : '') + '\n';
+  t += '💲 *Precios con IVA incluido*\n⚠️ Sujetos a disponibilidad al momento de confirmar\n';
   return t;
 }
 function copiarTexto(texto){
